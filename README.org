@@ -1,0 +1,662 @@
+*Gerbil GMime*, an FFI for A C/C++ MIME creation and parser library
+
+#+begin_src gerbil :tangle gerbil.pkg
+(package: drewc/gmime)
+#+end_src
+
+* Installation
+
+Here we use ~Nix~ for everything! This lib requires GMime >= 3.
+
+#+begin_src shell
+  nix search -u gmime
+  # =>
+  # * nixpkgs.gmime (gmime)
+  #  A C/C++ library for creating, editing and parsing MIME messages and structures
+
+  # * nixpkgs.gmime2 (gmime)
+  #  A C/C++ library for creating, editing and parsing MIME messages and structures
+
+  # * nixpkgs.gmime3 (gmime)
+  #  A C/C++ library for creating, editing and parsing MIME messages and structures
+  nix-env -iA nixpkgs.gmime3 nixpkgs.pkgconfig nixpkgs.mount nixpkgs.libselinux nixpkgs.libsepol 
+
+#+end_src
+
+
+
+** Ubuntu 
+It seems on the version of Ubuntu I'm currently running, it's 2.6. Regardless.
+
+#+begin_src shell
+sudo apt-get install libgmime*
+#+end_src
+
+#+begin_src shell
+pkg-config --cflags --libs gmime-2.6
+#=> -D_LARGEFILE64_SOURCE -pthread -I/usr/include/gmime-2.6 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -lgmime-2.6 -lgio-2.0 -lgobject-2.0 -lglib-2.0
+#+end_src
+
+
+* ~GObject~: The GLib Object System
+
+I think we'll be using this other places.
+
+** ~gobj_free~: Our own ~g_object_unref~
+
+ First things first, we'll make a function for the gerbil GC that frees the
+ object when done.
+
+ #+begin_src c :noweb-ref gobj_free
+ #ifndef ___HAVE_GOBJ_FREE
+ #define ___HAVE_GOBJ_FREE
+ ___SCMOBJ gobj_free (void *ptr)
+ {
+  g_object_unref (ptr);
+  return ___FIX (___NO_ERR);
+ }
+ #endif
+ #+end_src
+
+** ~define-c-GObject~: A prelude macro
+   :PROPERTIES:
+   :CUSTOM_ID: define_c_gobject
+   :END:
+
+
+Now that we have ~gobj_free~ we can make a way to easily define a gerbil
+interface to it.
+
+#+begin_src gerbil :noweb-ref define-c-GObject
+  (define-macro (define-c-GObject name)
+    (let* ((str (symbol->string name))
+           (ptr (string->symbol (string-append str "*"))))
+    `(begin (c-define-type ,name ,str)
+            (c-define-type ,ptr (pointer ,str (,ptr) "gobj_free")))))
+#+end_src
+
+** /File/ ~glib.ss~
+   
+ #+begin_src gerbil :tangle glib.ss :noweb yes
+   (import (for-syntax :std/foreign)  :std/foreign (for-syntax :std/stxutil))
+   (export begin-glib-ffi)
+   (defsyntax (begin-glib-ffi stx)
+     (def (prelude-macros)
+       '(
+         <<define-c-GObject>>
+         ))
+     (syntax-case stx ()
+       ((_ exports body ...)
+        (with-syntax (((macros ...) (prelude-macros)))
+          #'(begin-ffi
+             exports
+             macros ...
+             (c-declare "void gobj_free(void *ptr);")
+             (c-declare #<<END-C
+   #include <glib.h>
+   END-C
+   )
+            body ...
+            (c-declare #<<END-C
+   <<gobj_free>>
+   END-C
+   ))))))
+ #+end_src
+
+* ~gmime/foreign~: Avoid many ~c-declare~'s and ~g_mime_init()~
+
+
+This allows us to use it ... I think.
+
+#+begin_src gerbil :tangle foreign.ss
+  (import (for-syntax :drewc/gmime/glib) :std/foreign :drewc/gmime/glib)
+  (export begin-gmime-ffi g-mime-init)
+
+  (defsyntax (begin-gmime-ffi stx)
+    (syntax-case stx ()
+      ((_ exports body ...)
+       #'(begin-glib-ffi exports
+          (c-declare #<<END-C
+  #include <gmime/gmime.h>
+
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #include <sys/types.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+  #include <fcntl.h>
+  #include <errno.h>
+
+  END-C
+  )
+          body ...))))
+
+  (begin-gmime-ffi
+   (g-mime-init)
+   (c-initialize "g_mime_init();")
+   (define gmime-major-version (c-lambda () int "___return(gmime_major_version);"))
+   (define g-mime-init (c-lambda () void "g_mime_init")))
+
+#+end_src
+
+* ~GMimeMessage~: MIME Messages
+
+This is the whole point really! 
+
+https://developer.gnome.org/gmime/stable/GMimeMessage.html
+
+#+begin_src gerbil
+(define-c-GObject GMimeMessage)
+#+end_src
+
+
+** /Function/ ~parse-message-file(pathname)~
+
+ So the first thing is to parse a message and return it.
+
+#+begin_src gerbil :noweb-ref parse-message-file
+(define parse-message-file (c-lambda (char-string) GMimeMessage* "parse_message_file"))
+#+end_src
+
+*** /C Function/ ~parse_message_stream(GMimeStream*)~
+
+ #+begin_src c :noweb-ref parse_message_stream
+   static GMimeMessage *
+   parse_message_stream (GMimeStream *stream)
+   {
+     GMimeMessage *message;
+     GMimeParser *parser;
+
+    /* create a new parser object to parse the stream */
+     parser = g_mime_parser_new_with_stream (stream);
+
+     /* parse the message from the stream */
+     message = g_mime_parser_construct_message (parser, NULL);
+
+     /* free the parser */
+     g_object_unref (parser);
+     return message;
+   }
+ #+end_src
+
+*** /C Function/ ~parse_message_file(char *filename)~
+ #+begin_src c :noweb-ref parse_message_file
+   static GMimeMessage *
+   parse_message_file (char *filename)
+   {
+     GMimeStream *stream;
+     GMimeMessage *message;
+    
+     stream = g_mime_stream_file_open (filename, "r", NULL);
+
+     /* parse the message from the stream */
+     message = parse_message_stream(stream);
+
+     g_object_unref (stream);
+
+     return message;
+   }
+ #+end_src
+
+** /Function/ ~message-subject~
+
+#+begin_src gerbil :noweb-ref message-subject
+  (define message-subject
+    (c-lambda (GMimeMessage*) char-string
+      "___return((char*)g_mime_message_get_subject(___arg1));"))
+#+end_src
+** /File/ ~message.ss~
+
+#+begin_src gerbil :tangle message.ss :noweb yes
+  (import :drewc/gmime/foreign :std/foreign)
+  (export new-message parse-message-file message-subject)
+
+  (begin-gmime-ffi
+   (new-message parse-message-file message-subject)
+   (c-declare #<<END-C
+  <<parse_message_stream>>
+  <<parse_message_file>>
+  END-C
+  )
+   (define-c-GObject GMimeMessage)
+   (define new-message (c-lambda () GMimeMessage*  "___return(g_mime_message_new(FALSE));"))
+   <<parse-message-file>>
+   <<message-subject>>)
+
+
+
+#+end_src
+* TODO 
+* Testing
+
+** Start with examples
+   :PROPERTIES:
+   :CUSTOM_ID: testing_start_with_examples
+   :END:
+
+ Ok, back to FFI and need to get going, and in the gmime source[fn:gmgh] there's
+ a few examples.
+
+ For pkg-config to find the compilations command line using the nix package manager.
+
+ #+begin_src shell
+ export PKG_CONFIG_PATH=$(nix-shell -p gmime3 pkgconfig mount libselinux libsepol --run 'echo $PKG_CONFIG_PATH')
+ pkg-config --cflags --libs gmime-3.0
+ #+end_src
+
+ We've modified the [[#basic_example_c][~basic-example.c~]] to have a function to export, so let's see.
+
+ #+begin_src gerbil :tangle test/basic-example.ss :noweb yes
+     (import :std/foreign)
+     (export count-parts)
+     (extern count-parts)
+     (begin-foreign
+       (namespace ("drewc/gmime/test/basic-example#" count-parts))
+       (c-declare #<<c-declare-end
+     <<basic-example>>
+     c-declare-end
+       )
+       (define count-parts (c-lambda (char-string) int "count_parts")))
+ #+end_src
+
+ Now compile it. 
+
+ #+begin_src shell
+ gxc  -cc-options "`pkg-config --cflags gmime-3.0`"\
+      -ld-options "`pkg-config --libs gmime-3.0`"\
+  test/basic-example.ss
+ #+end_src
+
+ And test it out. 
+
+ #+begin_example 
+ $ gxi
+ Gerbil v0.15.1-461-gee22de62 on Gambit v4.9.3
+ > (import :drewc/gmime/test/basic-example)                                                                                                               
+ > (count-parts "test/Denial Letter  - Rhonda Hiebert DBA Rhondas Pampered Pets  Open Market Atrium  DOL August 2  2019  BOWOOD REF  BA1704739AAD   .eml")
+ There are 15 parts in the message
+ 15
+ > 
+ #+end_example
+
+ It works! 
+
+*** ~basic-example.c~
+    :PROPERTIES:
+    :CUSTOM_ID: basic_example_c
+    :END:
+
+  #+begin_src c :tangle basic-example.c :noweb-ref basic-example
+
+    #ifdef HAVE_CONFIG_H
+    #include <config.h>
+    #endif
+
+    #include <glib.h>
+    #include <gmime/gmime.h>
+
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <sys/types.h>
+    #include <sys/stat.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #include <errno.h>
+
+    static GMimeMessage *
+    parse_message (int fd)
+    {
+      GMimeMessage *message;
+      GMimeParser *parser;
+      GMimeStream *stream;
+
+      /* create a stream to read from the file descriptor */
+      stream = g_mime_stream_fs_new (fd);
+
+      /* create a new parser object to parse the stream */
+      parser = g_mime_parser_new_with_stream (stream);
+
+      /* unref the stream (parser owns a ref, so this object does not actually get free'd until we destroy the parser) */
+      g_object_unref (stream);
+
+      /* parse the message from the stream */
+      message = g_mime_parser_construct_message (parser, NULL);
+
+      /* free the parser (and the stream) */
+      g_object_unref (parser);
+
+      return message;
+    }
+
+
+    static void
+    count_foreach_callback (GMimeObject *parent, GMimeObject *part, gpointer user_data)
+    {
+      int *count = user_data;
+
+      (*count)++;
+
+      /* 'part' points to the current part node that
+       ,* g_mime_message_foreach() is iterating over */
+
+      /* find out what class 'part' is... */
+      if (GMIME_IS_MESSAGE_PART (part)) {
+        /* message/rfc822 or message/news */
+        GMimeMessage *message;
+
+        /* g_mime_message_foreach() won't descend into
+                       child message parts, so if we want to count any
+                       subparts of this child message, we'll have to call
+                       g_mime_message_foreach() again here. */
+
+        message = g_mime_message_part_get_message ((GMimeMessagePart *) part);
+        g_mime_message_foreach (message, count_foreach_callback, count);
+      } else if (GMIME_IS_MESSAGE_PARTIAL (part)) {
+        /* message/partial */
+
+        /* this is an incomplete message part, probably a
+                       large message that the sender has broken into
+                       smaller parts and is sending us bit by bit. we
+                       could save some info about it so that we could
+                       piece this back together again once we get all the
+                       parts? */
+      } else if (GMIME_IS_MULTIPART (part)) {
+        /* multipart/mixed, multipart/alternative,
+         ,* multipart/related, multipart/signed,
+         ,* multipart/encrypted, etc... */
+
+        /* we'll get to finding out if this is a
+         ,* signed/encrypted multipart later... */
+      } else if (GMIME_IS_PART (part)) {
+        /* a normal leaf part, could be text/plain or
+         ,* image/jpeg etc */
+      } else {
+        g_assert_not_reached ();
+      }
+    }
+
+    int
+    count_parts_in_message (GMimeMessage *message)
+    {
+      int count = 0;
+
+      /* count the number of parts (recursively) in the message
+       ,* including the container multiparts */
+      g_mime_message_foreach (message, count_foreach_callback, &count);
+
+      printf ("There are %d parts in the message\n", count);
+      return count;
+    }
+
+    #ifndef G_OS_WIN32
+    #ifdef ENABLE_CRYPTOGRAPHY
+    static void
+    verify_foreach_callback (GMimeObject *parent, GMimeObject *part, gpointer user_data)
+    {
+      if (GMIME_IS_MULTIPART_SIGNED (part)) {
+        /* this is a multipart/signed part, so we can verify the pgp signature */
+        GMimeMultipartSigned *mps = (GMimeMultipartSigned *) part;
+        GMimeSignatureList *signatures;
+        GMimeSignature *sig;
+        GError *err = NULL;
+        const char *str;
+        int i;
+
+        if (!(signatures = g_mime_multipart_signed_verify (mps, GMIME_VERIFY_NONE, &err))) {
+          /* an error occurred - probably couldn't start gpg? */
+
+          /* for more information about GError, see:
+           ,* http://developer.gnome.org/doc/API/2.0/glib/glib-Error-Reporting.html
+           ,*/
+
+          fprintf (stderr, "Failed to verify signed part: %s\n", err->message);
+          g_error_free (err);
+        } else {
+          /* print out validity info - GOOD vs BAD and "why" */
+          for (i = 0; i < g_mime_signature_list_length (signatures); i++) {
+            sig = g_mime_signature_list_get_signature (signatures, i);
+
+            if ((sig->status & GMIME_SIGNATURE_STATUS_RED) != 0)
+              str = "Bad";
+            else if ((sig->status & GMIME_SIGNATURE_STATUS_GREEN) != 0)
+              str = "Good";
+            else
+              str = "Error";
+          }
+
+          g_object_unref (signatures);
+        }
+      }
+    }
+
+    static void
+    verify_signed_parts (GMimeMessage *message)
+    {
+      /* descend the mime tree and verify any signed parts */
+      g_mime_message_foreach (message, verify_foreach_callback, NULL);
+    }
+    #endif
+    #endif
+
+    static void
+    write_message_to_screen (GMimeMessage *message)
+    {
+      GMimeStream *stream;
+
+      /* create a new stream for writing to stdout */
+      stream = g_mime_stream_file_new (stdout);
+      g_mime_stream_file_set_owner ((GMimeStreamFile *) stream, FALSE);
+
+      /* write the message to the stream */
+      g_mime_object_write_to_stream ((GMimeObject *) message, NULL, stream);
+
+      /* flush the stream (kinda like fflush() in libc's stdio) */
+      g_mime_stream_flush (stream);
+
+      /* free the output stream */
+      g_object_unref (stream);
+    }
+
+    #define TEXT_CONTENT "Hello, this is the new text/plain part's content text."
+
+    static void
+    add_a_mime_part (GMimeMessage *message)
+    {
+      GMimeMultipart *multipart;
+      GMimeTextPart *mime_part;
+
+      /* create the new part that we are going to add... */
+      mime_part = g_mime_text_part_new_with_subtype ("plain");
+
+      /* set the text content of the mime part */
+      g_mime_text_part_set_text (mime_part, TEXT_CONTENT);
+
+      /* if we want, we can tell GMime that the content should be base64 encoded when written to disk... */
+      g_mime_part_set_content_encoding ((GMimePart *) mime_part, GMIME_CONTENT_ENCODING_BASE64);
+
+      /* the "polite" way to modify a mime structure that we didn't
+         create is to create a new toplevel multipart/mixed part and
+         add the previous toplevel part as one of the subparts as
+         well as our text part that we just created... */
+
+      /* create a multipart/mixed part */
+      multipart = g_mime_multipart_new_with_subtype ("mixed");
+
+      /* add our new text part to it */
+      g_mime_multipart_add (multipart, (GMimeObject *) mime_part);
+      g_object_unref (mime_part);
+
+      /* now append the message's toplevel part to our multipart */
+      g_mime_multipart_add (multipart, message->mime_part);
+
+      /* now replace the message's toplevel mime part with our new multipart */
+      g_mime_message_set_mime_part (message, (GMimeObject *) multipart);
+      g_object_unref (multipart);
+    }
+
+    static void
+    remove_a_mime_part (GMimeMessage *message)
+    {
+      GMimeMultipart *multipart;
+
+      /* since we know the toplevel part is a multipart (we added it
+         in add_a_mime_part() earlier) and we know that the first
+         part of that multipart is our text part, lets remove the
+         first part of the toplevel mime part... */
+
+      multipart = (GMimeMultipart *) message->mime_part;
+
+      /* subpart indexes start at 0 */
+      g_mime_multipart_remove_at (multipart, 0);
+
+      /* now we should be left with a toplevel multipart/mixed which
+         contains the mime parts of the original message */
+    }
+
+    int count_parts(char* filename)
+    {
+      GMimeMessage *message;
+      int fd;
+      int parts;
+
+      if ((fd = open (filename, O_RDONLY, 0)) == -1) {
+        fprintf (stderr, "Cannot open message `%s': %s\n", filename, g_strerror (errno));
+        return 0;
+      }
+
+      /* init the gmime library */
+      g_mime_init ();
+
+      /* parse the message */
+      message = parse_message (fd);
+      if (message == NULL) {
+        printf ("Error parsing message\n");
+        return -1;
+      }
+
+      /* count the number of parts in the message */
+      parts = count_parts_in_message (message);
+
+    #ifndef G_OS_WIN32
+    #ifdef ENABLE_CRYPTOGRAPHY
+      /* verify any signed parts */
+      verify_signed_parts (message);
+    #endif
+    #endif
+
+      /* add and remove parts */
+      add_a_mime_part (message);
+      write_message_to_screen (message);
+
+      remove_a_mime_part (message);
+      write_message_to_screen (message);
+
+      /* free the mesage */
+      g_object_unref (message);
+
+      return parts;
+    }
+    int main (int argc, char **argv)
+    {
+      int res;
+
+      if (argc < 2) {
+        printf ("Usage: a.out <message file>\n");
+        return 0;
+      }
+
+      res = count_parts(argv[1]);
+    return res;
+    }
+  #+end_src
+
+** Task: Parse a Message and get the subject
+
+That seems like a good idea.
+
+*** Testing in C
+
+ To test out our message in C we'll use ~g_mime_message_get_subject ()~
+
+ #+begin_src c :noweb yes :tangle test/get_subject.c
+     #ifdef HAVE_CONFIG_H
+     #include <config.h>
+     #endif
+
+     #include <glib.h>
+     #include <gmime/gmime.h>
+
+     #include <stdio.h>
+     #include <stdlib.h>
+     #include <string.h>
+     #include <sys/types.h>
+     #include <sys/stat.h>
+     #include <unistd.h>
+     #include <fcntl.h>
+     #include <errno.h>
+
+     <<parse_message_stream>>
+
+     <<parse_message_file>>
+
+     int main (int argc, char **argv)
+     {
+       GMimeMessage *message;
+       const char* subject;
+
+       if (argc < 2) {
+         printf ("Get Subject Usage: a.out <message file>\n");
+         return 0;
+       }
+       g_mime_init ();
+    
+       message = parse_message_file (argv[1]);
+
+       subject = g_mime_message_get_subject (message);
+
+       printf ("Subject: %s", subject);
+
+       return 0;
+     }
+
+ #+end_src
+
+
+
+
+
+** Task: An alist of headers
+
+Making an alist of the headers seems like a good way to get used to things. I
+wonder how long it will take to get there? This is the second try after [[#testing_start_with_examples][start with examples]].
+
+There is a struct, ~GMimeHeader~ that we have to turn into a gerbil object. 
+
+#+begin_src gerbil
+(import :std/foreign :drewc/gmime/glib)
+
+(begin 
+(c-define-type GMimeHeader (struct "GMimeHeader"))
+(c-define-type GMimeHeader* (pointer "GMimeHeader" (GMimeHeader*) "gobj_free"))
+#+end_src
+
+
+
+ #+begin_src gerbil :tangle test/header-alist.ss :noweb yes
+  (import :std/foreign)
+  (export count-parts)
+  (extern count-parts)
+  (begin-foreign
+    (namespace ("drewc/gmime/test/header-alist#" count-parts))
+    (c-declare #<<c-declare-end
+  <<basic-example>>
+  c-declare-end
+    )
+    (define count-parts (c-lambda (char-string) int "count_parts")))
+#+end_src
+
+* Footnotes
+
+[fn:gmgh]  https://github.com/jstedfast/gmime
