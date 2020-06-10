@@ -68,11 +68,18 @@ Now that we have ~gobj_free~ we can make a way to easily define a gerbil
 interface to it.
 
 #+begin_src gerbil :noweb-ref define-c-GObject
-  (define-macro (define-c-GObject name)
-    (let* ((str (symbol->string name))
-           (ptr (string->symbol (string-append str "*"))))
-    `(begin (c-define-type ,name ,str)
-            (c-define-type ,ptr (pointer ,str (,ptr) "gobj_free")))))
+   (define-macro (define-c-GObject name . tags)
+     (let* ((str (symbol->string name))
+            (ptr (string->symbol (string-append str "*")))
+            (ptr-tags (cond ((and (pair? tags) (list? (car tags)))
+                             (cons ptr (car tags)))
+                            ((and (pair? tags) (eq? #f (car tags)))
+                             #f)
+                            (else (list ptr)))))
+
+
+     `(begin (c-define-type ,name ,str)
+             (c-define-type ,ptr (pointer ,str ,ptr-tags "gobj_free")))))
 #+end_src
 
 ** /File/ ~glib.ss~
@@ -91,11 +98,9 @@ interface to it.
           #'(begin-ffi
              exports
              macros ...
-             (c-declare "void gobj_free(void *ptr);")
-             (c-declare #<<END-C
-   #include <glib.h>
-   END-C
-   )
+             (c-declare "___SCMOBJ gobj_free(void *ptr);")
+             (c-declare "#include <glib.h>")
+             (define-c-GObject GObject #f)
             body ...
             (c-declare #<<END-C
    <<gobj_free>>
@@ -104,7 +109,6 @@ interface to it.
  #+end_src
 
 * ~gmime/foreign~: Avoid many ~c-declare~'s and ~g_mime_init()~
-
 
 This allows us to use it ... I think.
 
@@ -130,6 +134,11 @@ This allows us to use it ... I think.
 
   END-C
   )
+          (define-c-GObject GMimeObject #f)
+          (define-c-GObject GMimePartIter)
+          (define-c-GObject GMimeMessage)
+          (define-c-GObject InternetAddressList)
+
           body ...))))
 
   (begin-gmime-ffi
@@ -140,16 +149,74 @@ This allows us to use it ... I think.
 
 #+end_src
 
-* ~GMimeMessage~: MIME Messages
+** Emacs lisp highlight and indent 
 
+
+#+begin_src emacs-lisp
+  (defun gerbil:drewc/gmime-foreign ()
+    (interactive)
+
+    (gerbil-put'(begin-gmime-ffi) 'scheme-indent-function  1)
+
+    (gerbil-fontlock-add
+     (cons
+      (concat
+       "(" (regexp-opt '("begin-gmime-ffi")
+                       t)
+       "\\>")
+      '(1 'font-lock-keyword-face  ))))
+
+  (add-hook 'gerbil-mode-hook 'gerbil:drewc/gmime-foreign)
+#+end_src
+
+* ~GMimeObject~: Where all things descend from.
+
+~GMimeObject~ is an abstract class from which all message and MIME parts are derived.
+
+#+begin_src gerbil :tangle object.ss 
+  (import :drewc/gmime/foreign :std/foreign)
+  (export object->string) 
+  (begin-gmime-ffi (object->string)
+   (define object->string (c-lambda (GMimeObject*) char-string "___return(g_mime_object_to_string(___arg1, NULL));")))
+#+end_src
+
+* ~GMimePartIter~: Iterate through parts 
+
+MIME has parts. Multiparts as a matter of fact. This lets you iterate through them.
+
+#+begin_src gerbil :tangle part-iter.ss 
+    (import :drewc/gmime/foreign :std/foreign)
+    (export new-part-iter part-iter-next! part-iter-parent part-iter-current) 
+    (begin-gmime-ffi (new-part-iter part-iter-next! part-iter-parent part-iter-current)
+     (define new-part-iter (c-lambda (GMimeObject*) GMimePartIter* "g_mime_part_iter_new"))
+     (define part-iter-next! (c-lambda (GMimePartIter*) bool "g_mime_part_iter_next"))
+     (define part-iter-parent (c-lambda (GMimePartIter*) GMimeObject* "g_mime_part_iter_get_parent"))
+     (define part-iter-current (c-lambda (GMimePartIter*) GMimeObject* "g_mime_part_iter_get_current")))
+#+end_src
+
+
+
+* ~GMimeMessage~: MIME Messages
+  
 This is the whole point really! 
 
 https://developer.gnome.org/gmime/stable/GMimeMessage.html
-
-#+begin_src gerbil
-(define-c-GObject GMimeMessage)
+#+begin_src gerbil :noweb-ref message?
+(def (message? thing) (and (##foreign? thing) (GMIME_IS_MESSAGE thing)))
 #+end_src
 
+** ~new-message()~ and friends: Create a new message
+
+First the FFI
+#+begin_src gerbil :noweb-ref g-mime-message-new
+  (define g-mime-message-new (c-lambda (bool) GMimeMessage* "g_mime_message_new"))
+#+end_src
+
+Then some gerbil.
+
+#+begin_src gerbil :noweb-ref new-message
+  (def (new-message (pretty-headers #f)) (g-mime-message-new pretty-headers))
+#+end_src
 
 ** /Function/ ~parse-message-file(pathname)~
 
@@ -199,37 +266,142 @@ https://developer.gnome.org/gmime/stable/GMimeMessage.html
    }
  #+end_src
 
-** /Function/ ~message-subject~
+** /Function/ ~message-subject(message)~
 
 #+begin_src gerbil :noweb-ref message-subject
   (define message-subject
     (c-lambda (GMimeMessage*) char-string
       "___return((char*)g_mime_message_get_subject(___arg1));"))
 #+end_src
+
+** /Functions/ ~message-[from|sender|reply-to|to|cc|bcc]~
+
+#+begin_src gerbil :noweb-ref message-*
+  (define message-from (c-lambda (GMimeMessage*) InternetAddressList* "g_mime_message_get_from"))
+  (define message-sender (c-lambda (GMimeMessage*) InternetAddressList* "g_mime_message_get_sender"))
+  (define message-reply-to (c-lambda (GMimeMessage*) InternetAddressList* "g_mime_message_get_reply_to"))
+  (define message-to (c-lambda (GMimeMessage*) InternetAddressList* "g_mime_message_get_to"))
+  (define message-cc (c-lambda (GMimeMessage*) InternetAddressList* "g_mime_message_get_cc"))
+  (define message-bcc (c-lambda (GMimeMessage*) InternetAddressList* "g_mime_message_get_bcc"))
+#+end_src
+
+** /Function/ ~message-body(message)~
+
+#+begin_src gerbil :noweb-ref message-body
+  (define message-body (c-lambda (GMimeMessage*) GMimeObject* "g_mime_message_get_body"))
+#+end_src
+
 ** /File/ ~message.ss~
 
+
 #+begin_src gerbil :tangle message.ss :noweb yes
-  (import :drewc/gmime/foreign :std/foreign)
-  (export new-message parse-message-file message-subject)
+  (import :drewc/gmime/foreign :drewc/gmime/internet-address :std/foreign)
+  (export new-message parse-message-file
+          message-subject message-from message-to message-sender message-reply-to
+          message-to message-cc message-bcc message-body message?)
 
   (begin-gmime-ffi
-   (new-message parse-message-file message-subject)
-   (c-declare #<<END-C
+      (g-mime-message-new GMIME_IS_MESSAGE 
+       parse-message-file message-subject
+       message-from message-to message-sender message-reply-to message-to message-cc
+       message-bcc message-body)
+    (c-declare #<<END-C
   <<parse_message_stream>>
   <<parse_message_file>>
   END-C
   )
-   (define-c-GObject GMimeMessage)
-   (define new-message (c-lambda () GMimeMessage*  "___return(g_mime_message_new(FALSE));"))
-   <<parse-message-file>>
-   <<message-subject>>)
+    (define GMIME_IS_MESSAGE (c-lambda (GObject*) bool "GMIME_IS_MESSAGE"))
+    <<g-mime-message-new>>
+    <<parse-message-file>>
+    <<message-subject>>
+    <<message-*>>
+    <<message-body>>)
 
+  <<message?>>
+  <<new-message>>
+
+#+end_src
+
+* ~InternetAddress~ et al.
+
+#+begin_src gerbil :tangle internet-address.ss
+  (import :drewc/gmime/foreign :std/foreign)
+  (export internet-address-list-get-address
+          internet-address-list-length
+          internet-address-list->list
+          internet-address-list->string)
+
+  (begin-gmime-ffi
+   (InternetAddress
+    InternetAddress*
+    InternetAddressList InternetAddressList*
+    internet-address-list-length
+    internet-address-list-get-address 
+    internet-address-list->string)
+
+   (define-c-GObject InternetAddress)
+   (define-c-GObject InternetAddressList)
+
+   (define internet-address-list-length
+     (c-lambda (InternetAddressList*) int "internet_address_list_length"))
+   (define internet-address-list-get-address
+     (c-lambda (InternetAddressList* int) InternetAddress* "internet_address_list_get_address"))
+
+   ;; char *
+   ;; internet_address_list_to_string (InternetAddressList *list,
+   ;;                                  GMimeFormatOptions *options,
+   ;;                                  gboolean encode);
+
+   (define internet-address-list->string
+     (c-lambda (InternetAddressList*) char-string
+       "___return(internet_address_list_to_string (___arg1, NULL, TRUE));")))
+
+  (def (internet-address-list->list IAL)
+    (let IAL->list ((n (1- (internet-address-list-length IAL))))
+      (if (< n 0) '()
+          (cons (internet-address-list-get-address IAL n)
+                (IAL->list (- n 1))))))
+#+end_src
+* Testing
+
+This is also where development and hacking takes place a lot of the time, so let
+us give emacs some help.
+
+#+begin_src emacs-lisp
+  (defun gerbil:/std/test-syntax ()
+    (interactive)
+
+    (gerbil-put-indent '(test-suite test-case)  1)
+
+    (gerbil-fontlock-add
+     (cons
+      (concat
+       "(" (regexp-opt '("test.*")
+                       t)
+       "\\>")
+      '(1 'font-lock-keyword-face  ))))
+
+  (add-hook 'gerbil-mode-hook 'gerbil:/std/test-syntax)
+#+end_src
+
+And now a test-suite.
+
+#+begin_src gerbil
+  (import :std/test :std/sugar :drewc/gmime/message)
+
+  (def root-path (current-directory))
+  (def (path-exp file) (path-expand file root-path))
+
+  (def message-test
+    (test-suite "Test .eml"
+      (def eml0 "Unread messages from ober.eml")
+      (test-case "Check RFC0822 Headers"
+        (check (path-exp eml0) ? file-exists?))
+        (let (m (parse-message-file (path-exp eml0)))
+          (check (message-subject m) => "Unread messages from ober")))))
 
 
 #+end_src
-* TODO 
-* Testing
-
 ** Start with examples
    :PROPERTIES:
    :CUSTOM_ID: testing_start_with_examples
@@ -575,6 +747,23 @@ https://developer.gnome.org/gmime/stable/GMimeMessage.html
 ** Task: Parse a Message and get the subject
 
 That seems like a good idea.
+
+#+begin_src gerbil
+  (import :std/test :std/sugar :drewc/gmime/message)
+
+  (def root-path (current-directory))
+  (def (path-exp file) (path-expand file root-path))
+
+  (def message-test
+    (test-suite "Test .eml"
+      (def eml0 "Unread messages from ober.eml")
+      (test-case "Check RFC0822 Headers"
+        (check (path-exp eml0) ? file-exists?))
+        (let (m (parse-message-file (path-exp eml0)))
+          (check (message-subject m) => "Unread messages from ober")))))
+
+
+#+end_src
 
 *** Testing in C
 

@@ -19,6 +19,11 @@
 
 END-C
 )
+        (define-c-GObject GMimeObject #f)
+        (define-c-GObject GMimePartIter)
+        (define-c-GObject GMimeMessage)
+        (define-c-GObject InternetAddressList)
+
         body ...))))
 
 (begin-gmime-ffi

@@ -1,0 +1,7 @@
+(import :drewc/gmime/foreign :std/foreign)
+(export new-part-iter part-iter-next! part-iter-parent part-iter-current)
+(begin-gmime-ffi (new-part-iter part-iter-next! part-iter-parent part-iter-current)
+ (define new-part-iter (c-lambda (GMimeObject*) GMimePartIter* "g_mime_part_iter_new"))
+ (define part-iter-next! (c-lambda (GMimePartIter*) bool "g_mime_part_iter_next"))
+ (define part-iter-parent (c-lambda (GMimePartIter*) GMimeObject* "g_mime_part_iter_get_parent"))
+ (define part-iter-current (c-lambda (GMimePartIter*) GMimeObject* "g_mime_part_iter_get_current")))

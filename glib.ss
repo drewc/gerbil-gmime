@@ -3,11 +3,18 @@
 (defsyntax (begin-glib-ffi stx)
   (def (prelude-macros)
     '(
-      (define-macro (define-c-GObject name)
+      (define-macro (define-c-GObject name . tags)
         (let* ((str (symbol->string name))
-               (ptr (string->symbol (string-append str "*"))))
+               (ptr (string->symbol (string-append str "*")))
+               (ptr-tags (cond ((and (pair? tags) (list? (car tags)))
+                                (cons ptr (car tags)))
+                               ((and (pair? tags) (eq? #f (car tags)))
+                                #f)
+                               (else (list ptr)))))
+
+
         `(begin (c-define-type ,name ,str)
-                (c-define-type ,ptr (pointer ,str (,ptr) "gobj_free")))))
+                (c-define-type ,ptr (pointer ,str ,ptr-tags "gobj_free")))))
       ))
   (syntax-case stx ()
     ((_ exports body ...)
@@ -15,11 +22,9 @@
        #'(begin-ffi
           exports
           macros ...
-          (c-declare "void gobj_free(void *ptr);")
-          (c-declare #<<END-C
-#include <glib.h>
-END-C
-)
+          (c-declare "___SCMOBJ gobj_free(void *ptr);")
+          (c-declare "#include <glib.h>")
+          (define-c-GObject GObject #f)
          body ...
          (c-declare #<<END-C
 #ifndef ___HAVE_GOBJ_FREE
